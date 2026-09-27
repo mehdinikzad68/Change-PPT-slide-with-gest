@@ -8,8 +8,8 @@ import os
 import sys
 from PIL import Image, ImageDraw
 from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint
+from PyQt5.QtGui import QFont, QColor, QPainter, QBrush, QPen, QPainterPath, QRegion
 
 pystray_available = False
 if not (os.name == 'posix' and not os.environ.get('DISPLAY')):
@@ -26,6 +26,15 @@ try:
     win32com_available = True
 except ImportError:
     win32com_available = False
+
+def is_powerpoint_running():
+    for proc in psutil.process_iter(['name']):
+        try:
+            if proc.info['name'] and 'POWERPNT.EXE' in proc.info['name'].upper():
+                return True
+        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+            pass
+    return False
 
 class DummyLandmark:
     def __init__(self, x, y, z):
@@ -182,6 +191,14 @@ class ActionThread(threading.Thread):
             return True
         return False
 
+    def is_laser_pointer(self, fingers):
+        # Only index finger is open
+        return fingers[0] == 0 and fingers[1] == 1 and fingers[2] == 0 and fingers[3] == 0 and fingers[4] == 0
+
+    def is_spotlight(self, fingers):
+        # Thumb and index finger are open (L-shape)
+        return fingers[0] == 1 and fingers[1] == 1 and fingers[2] == 0 and fingers[3] == 0 and fingers[4] == 0
+
     def are_two_fingers_left(self, landmarks, previous_landmarks):
         if previous_landmarks is None:
             return False
@@ -206,8 +223,28 @@ class ActionThread(threading.Thread):
                     fingers = self.fingers_open(landmarks)
                     palm_open = all(f == 1 for f in fingers)
                     fist = all(f == 0 for f in fingers)
+                    laser_pointer = self.is_laser_pointer(fingers)
+                    spotlight = self.is_spotlight(fingers)
                     index_right = False
                     two_fingers_left = False
+
+                    # Always send AR updates for fluid movement, if active and engaged
+                    if self.engagement_active:
+                        if laser_pointer or spotlight:
+                            # Index finger tip is landmark 8. We mirror the x coordinate so it feels like a mirror.
+                            # Also sometimes coordinates go slightly out of 0-1 bounds.
+                            x = 1.0 - landmarks[8].x
+                            y = landmarks[8].y
+                            self.ui_queue.put({
+                                "type": "ar_update",
+                                "pointer": laser_pointer,
+                                "spotlight": spotlight,
+                                "x": x,
+                                "y": y
+                            })
+                        else:
+                            # Clear AR state
+                            self.ui_queue.put({"type": "ar_update", "pointer": False, "spotlight": False})
 
                     if self.previous_landmarks:
                         index_right = self.is_index_right(landmarks, self.previous_landmarks)
@@ -331,6 +368,12 @@ class UIUpdater(QObject):
 class HUDWindow(QWidget):
     def __init__(self):
         super().__init__()
+
+        # AR State
+        self.pointer_active = False
+        self.pointer_pos = QPoint(0, 0)
+        self.spotlight_active = False
+
         self.initUI()
 
         self.fade_timer = QTimer(self)
@@ -338,33 +381,70 @@ class HUDWindow(QWidget):
         self.fade_timer.setSingleShot(True)
 
     def initUI(self):
-        # Make the window frameless, transparent, and always on top
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowTransparentForInput)
         self.setAttribute(Qt.WA_TranslucentBackground)
 
-        # Position in bottom right corner (or center bottom)
-        # Using fixed small size for the notification
-        self.resize(300, 100)
+        # Always cover full screen for AR overlay
+        screen = QApplication.primaryScreen().geometry()
+        self.setGeometry(screen)
+        self.screen_width = screen.width()
+        self.screen_height = screen.height()
 
-        self.layout = QVBoxLayout()
         self.label = QLabel("", self)
         self.label.setAlignment(Qt.AlignCenter)
         self.label.setFont(QFont("Arial", 24, QFont.Bold))
         self.label.setStyleSheet("color: rgba(0, 255, 0, 255); background-color: rgba(0, 0, 0, 150); border-radius: 10px; padding: 10px;")
 
-        self.layout.addWidget(self.label)
-        self.setLayout(self.layout)
+        # Position label in bottom right manually since we don't use a layout that fills the screen
+        self.label.resize(300, 100)
+        self.label.move(self.screen_width - 350, 50)
+        self.label.hide()
 
-        # Move to top right corner as an example
-        screen = QApplication.primaryScreen().geometry()
-        self.move(screen.width() - self.width() - 50, 50)
+        self.showFullScreen()
 
-        self.hide()
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        if self.spotlight_active:
+            # Draw semi-transparent dark background
+            path = QPainterPath()
+            path.addRect(0, 0, self.screen_width, self.screen_height)
+
+            # Cut out a circle for the spotlight
+            spot_path = QPainterPath()
+            spot_path.addEllipse(self.pointer_pos, 150, 150)
+
+            # Subtracted path
+            final_path = path.subtracted(spot_path)
+
+            painter.setBrush(QColor(0, 0, 0, 180)) # 70% opacity black
+            painter.setPen(Qt.NoPen)
+            painter.drawPath(final_path)
+
+        elif self.pointer_active:
+            # Draw red laser dot
+            painter.setBrush(QBrush(QColor(255, 0, 0, 255)))
+            painter.setPen(Qt.NoPen)
+            painter.drawEllipse(self.pointer_pos, 10, 10)
 
     def show_message(self, data):
-        msg = data.get("msg", "")
-        msg_type = data.get("type", "action")
+        msg_type = data.get("type", "")
 
+        if msg_type == "ar_update":
+            self.pointer_active = data.get("pointer", False)
+            self.spotlight_active = data.get("spotlight", False)
+
+            if self.pointer_active or self.spotlight_active:
+                # Map 0.0-1.0 coords to screen
+                x = int(data.get("x", 0.5) * self.screen_width)
+                y = int(data.get("y", 0.5) * self.screen_height)
+                self.pointer_pos = QPoint(x, y)
+
+            self.update() # Trigger repaint
+            return
+
+        msg = data.get("msg", "")
         if msg_type == "status":
             if msg == "AWAKE":
                 self.label.setStyleSheet("color: rgba(0, 255, 0, 255); background-color: rgba(0, 0, 0, 150); border-radius: 10px; padding: 10px;")
@@ -374,13 +454,12 @@ class HUDWindow(QWidget):
             self.label.setStyleSheet("color: rgba(0, 255, 255, 255); background-color: rgba(0, 0, 0, 150); border-radius: 10px; padding: 10px;")
 
         self.label.setText(msg)
-        self.show()
+        self.label.show()
 
-        # Hide after 1.5 seconds
         self.fade_timer.start(1500)
 
     def hide_status(self):
-        self.hide()
+        self.label.hide()
 
 def check_ui_queue(ui_queue, updater):
     try:
