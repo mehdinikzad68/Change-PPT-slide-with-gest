@@ -13,6 +13,7 @@ from PyQt5.QtCore import QObject, QPoint, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QPainter, QPainterPath, QFont
 from PyQt5.QtWidgets import QApplication, QLabel, QWidget
 
+from powerpoint_runtime import PowerPointProcessCache, resolve_active_presentation, resolve_slideshow_view
 from telemetry_utils import TelemetryWriter, build_telemetry_record, compute_fps
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -29,9 +30,17 @@ else:
     logger.info("Pystray not available (no DISPLAY in environment).")
 
 try:
+    import pythoncom
+    import pywintypes
     import win32com.client
+
+    COM_ERROR = pywintypes.com_error
     win32com_available = True
 except ImportError:
+    pythoncom = None
+    pywintypes = None
+    win32com = None
+    COM_ERROR = RuntimeError
     win32com_available = False
 
 
@@ -88,12 +97,17 @@ class AIThread(threading.Thread):
         self.hands = self.mp_hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.7)
         self.running = True
         self.previous_capture_time = None
+        self.powerpoint_process_cache = (
+            PowerPointProcessCache(checker=is_powerpoint_running, ttl_seconds=1.5)
+            if win32com_available else None
+        )
 
     def run(self):
         while self.running:
             try:
-                # Pause AI processing if PPT is not running
-                if win32com_available and not is_powerpoint_running():
+                # Pause AI processing if PPT is not running.
+                # Process checks are cached to avoid scanning processes on every frame.
+                if self.powerpoint_process_cache and not self.powerpoint_process_cache.is_running():
                     time.sleep(1)
                     # We still need to consume the frame queue so it doesn't block CameraThread indefinitely
                     try:
@@ -152,19 +166,8 @@ class ActionThread(threading.Thread):
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
 
-        self.powerpoint = None
-        self.presentation = None
         if win32com_available:
-            try:
-                self.powerpoint = win32com.client.GetActiveObject("PowerPoint.Application")
-            except Exception:
-                self.powerpoint = win32com.client.Dispatch("PowerPoint.Application")
-
-            if self.powerpoint and hasattr(self.powerpoint, "Presentations") and self.powerpoint.Presentations.Count > 0:
-                self.presentation = self.powerpoint.ActivePresentation
-                logger.info("Active presentation title: %s", self.presentation.Name)
-            else:
-                logger.info("No active presentation")
+            logger.info("PowerPoint COM controls enabled.")
         else:
             logger.info("win32com not available. PowerPoint controls disabled.")
 
@@ -184,6 +187,23 @@ class ActionThread(threading.Thread):
 
         self.alpha = 0.5
         self.smoothed_landmarks = None
+
+    def _get_powerpoint_application(self):
+        if not win32com_available:
+            return None
+        return win32com.client.GetActiveObject("PowerPoint.Application")
+
+    def _get_active_presentation(self):
+        powerpoint = self._get_powerpoint_application()
+        if powerpoint is None:
+            return None
+        return resolve_active_presentation(powerpoint)
+
+    def _get_slideshow_view(self):
+        powerpoint = self._get_powerpoint_application()
+        if powerpoint is None:
+            return None
+        return resolve_slideshow_view(powerpoint)
 
     def apply_ema(self, current_landmarks):
         if self.smoothed_landmarks is None:
@@ -263,205 +283,236 @@ class ActionThread(threading.Thread):
         self.telemetry_writer.write(record)
 
     def run(self):
-        while self.running:
-            try:
-                data = self.action_queue.get(timeout=0.1)
-                landmarks = data["landmarks"]
-                image = data["image"]
-                multi_hand_landmarks = data["multi_hand_landmarks"]
-                telemetry_context = data["telemetry"]
-                t_decision = time.monotonic()
-                gesture = "no_hand"
-                command = None
-                t_com_start = None
-                t_com_end = None
-                telemetry_error = None
+        com_initialized = False
+        if win32com_available:
+            pythoncom.CoInitialize()
+            com_initialized = True
+            logger.info("ActionThread initialized COM apartment.")
 
-                if landmarks and len(landmarks) == 21:
-                    landmarks = self.apply_ema(landmarks)
+        try:
+            while self.running:
+                try:
+                    data = self.action_queue.get(timeout=0.1)
+                    landmarks = data["landmarks"]
+                    image = data["image"]
+                    multi_hand_landmarks = data["multi_hand_landmarks"]
+                    telemetry_context = data["telemetry"]
+                    t_decision = time.monotonic()
+                    gesture = "no_hand"
+                    command = None
+                    t_com_start = None
+                    t_com_end = None
+                    telemetry_error = None
 
-                    fingers = self.fingers_open(landmarks)
-                    palm_open = all(f == 1 for f in fingers)
-                    fist = all(f == 0 for f in fingers)
-                    laser_pointer = self.is_laser_pointer(fingers)
-                    spotlight = self.is_spotlight(fingers)
-                    index_right = False
-                    two_fingers_left = False
+                    if landmarks and len(landmarks) == 21:
+                        landmarks = self.apply_ema(landmarks)
 
-                    if palm_open:
-                        gesture = "palm_open"
-                    elif fist:
-                        gesture = "fist"
-                    elif laser_pointer:
-                        gesture = "laser_pointer"
-                    elif spotlight:
-                        gesture = "spotlight"
-                    else:
-                        gesture = "hand_detected"
+                        fingers = self.fingers_open(landmarks)
+                        palm_open = all(f == 1 for f in fingers)
+                        fist = all(f == 0 for f in fingers)
+                        laser_pointer = self.is_laser_pointer(fingers)
+                        spotlight = self.is_spotlight(fingers)
+                        index_right = False
+                        two_fingers_left = False
 
-                    # Always send AR updates for fluid movement, if active and engaged
-                    if self.engagement_active:
-                        if laser_pointer or spotlight:
-                            # Index finger tip is landmark 8. We mirror the x coordinate so it feels like a mirror.
-                            # Also sometimes coordinates go slightly out of 0-1 bounds.
-                            x = 1.0 - landmarks[8].x
-                            y = landmarks[8].y
-                            self.ui_queue.put({
-                                "type": "ar_update",
-                                "pointer": laser_pointer,
-                                "spotlight": spotlight,
-                                "x": x,
-                                "y": y
-                            })
-                        else:
-                            # Clear AR state
-                            self.ui_queue.put({"type": "ar_update", "pointer": False, "spotlight": False})
-
-                    if self.previous_landmarks:
-                        index_right = self.is_index_right(landmarks, self.previous_landmarks)
-                        two_fingers_left = self.are_two_fingers_left(landmarks, self.previous_landmarks)
-                    self.previous_landmarks = landmarks
-
-                    if index_right:
-                        gesture = "index_right"
-                    elif two_fingers_left:
-                        gesture = "two_fingers_left"
-
-                    if palm_open:
-                        if not self.engagement_active:
-                            self.engagement_gesture_count += 1
-                            if self.engagement_gesture_count >= self.ENGAGEMENT_FRAMES_REQUIRED:
-                                self.engagement_active = True
-                                self.ui_queue.put({"type": "status", "msg": "AWAKE"})
-                                logger.info("Engagement State ACTIVE. System is listening for gestures...")
-                                self.engagement_gesture_count = 0
-                                time.sleep(0.5)
-                        else:
-                            self.palm_open_count += 1
-                    else:
-                        if not self.engagement_active:
-                            self.engagement_gesture_count = 0
-
-                    if not self.engagement_active:
-                        self.palm_open_count = 0
-                        self.fist_count = 0
-                        self.index_right_count = 0
-                        self.two_fingers_left_count = 0
-                    else:
                         if palm_open:
+                            gesture = "palm_open"
+                        elif fist:
+                            gesture = "fist"
+                        elif laser_pointer:
+                            gesture = "laser_pointer"
+                        elif spotlight:
+                            gesture = "spotlight"
+                        else:
+                            gesture = "hand_detected"
+
+                        # Always send AR updates for fluid movement, if active and engaged
+                        if self.engagement_active:
+                            if laser_pointer or spotlight:
+                                # Index finger tip is landmark 8. We mirror the x coordinate so it feels like a mirror.
+                                # Also sometimes coordinates go slightly out of 0-1 bounds.
+                                x = 1.0 - landmarks[8].x
+                                y = landmarks[8].y
+                                self.ui_queue.put({
+                                    "type": "ar_update",
+                                    "pointer": laser_pointer,
+                                    "spotlight": spotlight,
+                                    "x": x,
+                                    "y": y
+                                })
+                            else:
+                                # Clear AR state
+                                self.ui_queue.put({"type": "ar_update", "pointer": False, "spotlight": False})
+
+                        if self.previous_landmarks:
+                            index_right = self.is_index_right(landmarks, self.previous_landmarks)
+                            two_fingers_left = self.are_two_fingers_left(landmarks, self.previous_landmarks)
+                        self.previous_landmarks = landmarks
+
+                        if index_right:
+                            gesture = "index_right"
+                        elif two_fingers_left:
+                            gesture = "two_fingers_left"
+
+                        if palm_open:
+                            if not self.engagement_active:
+                                self.engagement_gesture_count += 1
+                                if self.engagement_gesture_count >= self.ENGAGEMENT_FRAMES_REQUIRED:
+                                    self.engagement_active = True
+                                    self.ui_queue.put({"type": "status", "msg": "AWAKE"})
+                                    logger.info("Engagement State ACTIVE. System is listening for gestures...")
+                                    self.engagement_gesture_count = 0
+                                    time.sleep(0.5)
+                            else:
+                                self.palm_open_count += 1
+                        else:
+                            if not self.engagement_active:
+                                self.engagement_gesture_count = 0
+
+                        if not self.engagement_active:
+                            self.palm_open_count = 0
                             self.fist_count = 0
                             self.index_right_count = 0
                             self.two_fingers_left_count = 0
-                            if self.palm_open_count >= self.GESTURE_CONSECUTIVE_FRAMES:
-                                if not self.slide_show_started:
+                        else:
+                            if palm_open:
+                                self.fist_count = 0
+                                self.index_right_count = 0
+                                self.two_fingers_left_count = 0
+                                if self.palm_open_count >= self.GESTURE_CONSECUTIVE_FRAMES:
                                     try:
-                                        if self.presentation:
+                                        presentation = self._get_active_presentation()
+                                        if presentation:
                                             t_com_start = time.monotonic()
-                                            self.presentation.SlideShowSettings.Run()
+                                            presentation.SlideShowSettings.Run()
                                             t_com_end = time.monotonic()
                                             self.slide_show_started = True
                                             command = "start_slideshow"
                                             self.ui_queue.put({"type": "action", "msg": "START SLIDESHOW"})
                                             logger.info("Starting slide show")
-                                    except Exception as e:
+                                        else:
+                                            logger.info("No active presentation available to start slideshow.")
+                                    except COM_ERROR as e:
                                         telemetry_error = str(e)
-                                        t_com_end = time.monotonic()
-                                        logger.exception("Error starting slide show")
+                                        if t_com_start is not None:
+                                            t_com_end = time.monotonic()
+                                        logger.exception("PowerPoint COM error while starting slide show")
+                                    self.palm_open_count = 0
+                            elif fist:
+                                self.fist_count += 1
                                 self.palm_open_count = 0
-                        elif fist:
-                            self.fist_count += 1
-                            self.palm_open_count = 0
-                            self.index_right_count = 0
-                            self.two_fingers_left_count = 0
-                            if self.fist_count >= self.GESTURE_CONSECUTIVE_FRAMES:
-                                self.engagement_active = False
-                                self.ui_queue.put({"type": "status", "msg": "ASLEEP"})
-                                logger.info("Engagement State DEACTIVATED. Sleeping...")
-                                if self.slide_show_started:
-                                    try:
-                                        if self.presentation and self.presentation.SlideShowWindow:
-                                            t_com_start = time.monotonic()
-                                            self.presentation.SlideShowWindow.View.Exit()
-                                            t_com_end = time.monotonic()
-                                            self.slide_show_started = False
-                                            command = "end_slideshow"
-                                            self.ui_queue.put({"type": "action", "msg": "END SLIDESHOW"})
-                                            logger.info("Ending slide show")
-                                    except Exception as e:
-                                        telemetry_error = str(e)
-                                        t_com_end = time.monotonic()
-                                        logger.exception("Error ending slide show")
-                                self.fist_count = 0
-                        elif index_right:
-                            self.index_right_count += 1
-                            self.palm_open_count = 0
-                            self.fist_count = 0
-                            self.two_fingers_left_count = 0
-                            if self.index_right_count >= self.GESTURE_CONSECUTIVE_FRAMES:
-                                try:
-                                    if self.presentation and self.presentation.SlideShowWindow:
-                                        current_slide = self.presentation.SlideShowWindow.View.Slide
-                                        if current_slide.SlideIndex < self.presentation.Slides.Count:
-                                            t_com_start = time.monotonic()
-                                            self.presentation.SlideShowWindow.View.Next()
-                                            t_com_end = time.monotonic()
-                                            command = "next_slide"
-                                            self.ui_queue.put({"type": "action", "msg": "NEXT SLIDE ->"})
-                                            logger.info("Next slide")
-                                            time.sleep(0.5)
-                                except Exception as e:
-                                    telemetry_error = str(e)
-                                    t_com_end = time.monotonic()
-                                    logger.exception("Error going to next slide")
                                 self.index_right_count = 0
-                        elif two_fingers_left:
-                            self.two_fingers_left_count += 1
-                            self.palm_open_count = 0
-                            self.fist_count = 0
-                            self.index_right_count = 0
-                            if self.two_fingers_left_count >= self.GESTURE_CONSECUTIVE_FRAMES:
-                                try:
-                                    if self.presentation and self.presentation.SlideShowWindow:
-                                        current_slide = self.presentation.SlideShowWindow.View.Slide
-                                        if current_slide.SlideIndex > 1:
-                                            t_com_start = time.monotonic()
-                                            self.presentation.SlideShowWindow.View.Previous()
-                                            t_com_end = time.monotonic()
-                                            command = "previous_slide"
-                                            self.ui_queue.put({"type": "action", "msg": "<- PREV SLIDE"})
-                                            logger.info("Previous slide")
-                                            time.sleep(0.5)
-                                except Exception as e:
-                                    telemetry_error = str(e)
-                                    t_com_end = time.monotonic()
-                                    logger.exception("Error going to previous slide")
                                 self.two_fingers_left_count = 0
-                        else:
-                            self.palm_open_count = 0
-                            self.fist_count = 0
-                            self.index_right_count = 0
-                            self.two_fingers_left_count = 0
-                else:
-                    self.previous_landmarks = None
-                    self.smoothed_landmarks = None
-                    self.palm_open_count = 0
-                    self.fist_count = 0
-                    self.index_right_count = 0
-                    self.two_fingers_left_count = 0
-                    if not self.engagement_active:
-                        self.engagement_gesture_count = 0
+                                if self.fist_count >= self.GESTURE_CONSECUTIVE_FRAMES:
+                                    self.engagement_active = False
+                                    self.ui_queue.put({"type": "status", "msg": "ASLEEP"})
+                                    logger.info("Engagement State DEACTIVATED. Sleeping...")
+                                    if self.slide_show_started:
+                                        try:
+                                            slideshow_view = self._get_slideshow_view()
+                                            if slideshow_view:
+                                                t_com_start = time.monotonic()
+                                                slideshow_view.Exit()
+                                                t_com_end = time.monotonic()
+                                                self.slide_show_started = False
+                                                command = "end_slideshow"
+                                                self.ui_queue.put({"type": "action", "msg": "END SLIDESHOW"})
+                                                logger.info("Ending slide show")
+                                            else:
+                                                logger.info("No slideshow window available to end slideshow.")
+                                                self.slide_show_started = False
+                                        except COM_ERROR as e:
+                                            telemetry_error = str(e)
+                                            if t_com_start is not None:
+                                                t_com_end = time.monotonic()
+                                            logger.exception("PowerPoint COM error while ending slide show")
+                                    self.fist_count = 0
+                            elif index_right:
+                                self.index_right_count += 1
+                                self.palm_open_count = 0
+                                self.fist_count = 0
+                                self.two_fingers_left_count = 0
+                                if self.index_right_count >= self.GESTURE_CONSECUTIVE_FRAMES:
+                                    try:
+                                        slideshow_view = self._get_slideshow_view()
+                                        if slideshow_view:
+                                            current_slide = slideshow_view.Slide
+                                            presentation = self._get_active_presentation()
+                                            if presentation and current_slide.SlideIndex < presentation.Slides.Count:
+                                                t_com_start = time.monotonic()
+                                                slideshow_view.Next()
+                                                t_com_end = time.monotonic()
+                                                command = "next_slide"
+                                                self.ui_queue.put({"type": "action", "msg": "NEXT SLIDE ->"})
+                                                logger.info("Next slide")
+                                                time.sleep(0.5)
+                                        else:
+                                            logger.info("No slideshow window available for next slide command.")
+                                    except COM_ERROR as e:
+                                        telemetry_error = str(e)
+                                        if t_com_start is not None:
+                                            t_com_end = time.monotonic()
+                                        logger.exception("PowerPoint COM error while going to next slide")
+                                    self.index_right_count = 0
+                            elif two_fingers_left:
+                                self.two_fingers_left_count += 1
+                                self.palm_open_count = 0
+                                self.fist_count = 0
+                                self.index_right_count = 0
+                                if self.two_fingers_left_count >= self.GESTURE_CONSECUTIVE_FRAMES:
+                                    try:
+                                        slideshow_view = self._get_slideshow_view()
+                                        if slideshow_view:
+                                            current_slide = slideshow_view.Slide
+                                            if current_slide.SlideIndex > 1:
+                                                t_com_start = time.monotonic()
+                                                slideshow_view.Previous()
+                                                t_com_end = time.monotonic()
+                                                command = "previous_slide"
+                                                self.ui_queue.put({"type": "action", "msg": "<- PREV SLIDE"})
+                                                logger.info("Previous slide")
+                                                time.sleep(0.5)
+                                        else:
+                                            logger.info("No slideshow window available for previous slide command.")
+                                    except COM_ERROR as e:
+                                        telemetry_error = str(e)
+                                        if t_com_start is not None:
+                                            t_com_end = time.monotonic()
+                                        logger.exception("PowerPoint COM error while going to previous slide")
+                                    self.two_fingers_left_count = 0
+                            else:
+                                self.palm_open_count = 0
+                                self.fist_count = 0
+                                self.index_right_count = 0
+                                self.two_fingers_left_count = 0
+                    else:
+                        self.previous_landmarks = None
+                        self.smoothed_landmarks = None
+                        self.palm_open_count = 0
+                        self.fist_count = 0
+                        self.index_right_count = 0
+                        self.two_fingers_left_count = 0
+                        if not self.engagement_active:
+                            self.engagement_gesture_count = 0
 
-                self.emit_telemetry(
-                    telemetry_context,
-                    gesture,
-                    command,
-                    t_decision,
-                    t_com_start=t_com_start,
-                    t_com_end=t_com_end,
-                    error=telemetry_error,
-                )
-            except queue.Empty:
-                pass
+                    del image
+                    del multi_hand_landmarks
+
+                    self.emit_telemetry(
+                        telemetry_context,
+                        gesture,
+                        command,
+                        t_decision,
+                        t_com_start=t_com_start,
+                        t_com_end=t_com_end,
+                        error=telemetry_error,
+                    )
+                except queue.Empty:
+                    pass
+        finally:
+            if com_initialized:
+                pythoncom.CoUninitialize()
+                logger.info("ActionThread uninitialized COM apartment.")
 
     def stop(self):
         self.running = False
