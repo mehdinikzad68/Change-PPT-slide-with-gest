@@ -1,31 +1,39 @@
+import argparse
 import cv2
+import logging
 import mediapipe as mp
-import time
-import threading
-import queue
-import psutil
 import os
+import psutil
+import queue
 import sys
+import threading
+import time
 from PIL import Image, ImageDraw
-from PyQt5.QtWidgets import QApplication, QWidget, QLabel, QVBoxLayout
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPoint
-from PyQt5.QtGui import QFont, QColor, QPainter, QBrush, QPen, QPainterPath, QRegion
+from PyQt5.QtCore import QObject, QPoint, Qt, QTimer, pyqtSignal
+from PyQt5.QtGui import QBrush, QColor, QPainter, QPainterPath, QFont
+from PyQt5.QtWidgets import QApplication, QLabel, QWidget
+
+from telemetry_utils import TelemetryWriter, build_telemetry_record, compute_fps
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 pystray_available = False
 if not (os.name == 'posix' and not os.environ.get('DISPLAY')):
     try:
         import pystray
         pystray_available = True
-    except Exception as e:
-        print("Pystray exception:", e)
+    except Exception:
+        logger.exception("Pystray import failed")
 else:
-    print("Pystray not available (no DISPLAY in environment).")
+    logger.info("Pystray not available (no DISPLAY in environment).")
 
 try:
     import win32com.client
     win32com_available = True
 except ImportError:
     win32com_available = False
+
 
 def is_powerpoint_running():
     for proc in psutil.process_iter(['name']):
@@ -36,11 +44,13 @@ def is_powerpoint_running():
             pass
     return False
 
+
 class DummyLandmark:
     def __init__(self, x, y, z):
         self.x = x
         self.y = y
         self.z = z
+
 
 class CameraThread(threading.Thread):
 
@@ -54,18 +64,20 @@ class CameraThread(threading.Thread):
         while self.running:
             success, image = self.cap.read()
             if success:
+                t_capture = time.monotonic()
                 if self.frame_queue.full():
                     try:
                         self.frame_queue.get_nowait()
                     except queue.Empty:
                         pass
-                self.frame_queue.put(image)
+                self.frame_queue.put((image, t_capture))
             else:
                 time.sleep(0.01)
         self.cap.release()
 
     def stop(self):
         self.running = False
+
 
 class AIThread(threading.Thread):
     def __init__(self, frame_queue, action_queue):
@@ -75,6 +87,7 @@ class AIThread(threading.Thread):
         self.mp_hands = mp.solutions.hands
         self.hands = self.mp_hands.Hands(static_image_mode=False, max_num_hands=1, min_detection_confidence=0.7)
         self.running = True
+        self.previous_capture_time = None
 
     def run(self):
         while self.running:
@@ -89,9 +102,11 @@ class AIThread(threading.Thread):
                         pass
                     continue
 
-                image = self.frame_queue.get(timeout=0.1)
+                image, t_capture = self.frame_queue.get(timeout=0.1)
+                t_infer_start = time.monotonic()
                 image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
                 results = self.hands.process(image_rgb)
+                t_infer_end = time.monotonic()
 
                 landmarks = None
                 if results.multi_hand_landmarks:
@@ -105,7 +120,20 @@ class AIThread(threading.Thread):
                     except queue.Empty:
                         pass
 
-                self.action_queue.put((landmarks, image, results.multi_hand_landmarks))
+                fps = compute_fps(t_capture, self.previous_capture_time)
+                self.previous_capture_time = t_capture
+
+                self.action_queue.put({
+                    "landmarks": landmarks,
+                    "image": image,
+                    "multi_hand_landmarks": results.multi_hand_landmarks,
+                    "telemetry": {
+                        "t_capture": t_capture,
+                        "t_infer_start": t_infer_start,
+                        "t_infer_end": t_infer_end,
+                        "fps": fps,
+                    },
+                })
             except queue.Empty:
                 pass
         self.hands.close()
@@ -113,11 +141,13 @@ class AIThread(threading.Thread):
     def stop(self):
         self.running = False
 
+
 class ActionThread(threading.Thread):
-    def __init__(self, action_queue, ui_queue):
+    def __init__(self, action_queue, ui_queue, telemetry_writer=None):
         super().__init__()
         self.action_queue = action_queue
         self.ui_queue = ui_queue
+        self.telemetry_writer = telemetry_writer
         self.running = True
         self.mp_hands = mp.solutions.hands
         self.mp_drawing = mp.solutions.drawing_utils
@@ -127,16 +157,16 @@ class ActionThread(threading.Thread):
         if win32com_available:
             try:
                 self.powerpoint = win32com.client.GetActiveObject("PowerPoint.Application")
-            except:
+            except Exception:
                 self.powerpoint = win32com.client.Dispatch("PowerPoint.Application")
 
             if self.powerpoint and hasattr(self.powerpoint, "Presentations") and self.powerpoint.Presentations.Count > 0:
                 self.presentation = self.powerpoint.ActivePresentation
-                print("Active presentation title:", self.presentation.Name)
+                logger.info("Active presentation title: %s", self.presentation.Name)
             else:
-                print("No active presentation")
+                logger.info("No active presentation")
         else:
-            print("win32com not available. PowerPoint controls disabled.")
+            logger.info("win32com not available. PowerPoint controls disabled.")
 
         self.MOVEMENT_THRESHOLD = 0.005
         self.GESTURE_CONSECUTIVE_FRAMES = 5
@@ -211,11 +241,41 @@ class ActionThread(threading.Thread):
             return True
         return False
 
+    def emit_telemetry(self, telemetry_context, gesture, command, t_decision, t_com_start=None, t_com_end=None, error=None):
+        if not self.telemetry_writer:
+            return
+
+        record = build_telemetry_record(
+            t_capture=telemetry_context.get("t_capture"),
+            t_infer_start=telemetry_context.get("t_infer_start"),
+            t_infer_end=telemetry_context.get("t_infer_end"),
+            t_decision=t_decision,
+            t_com_start=t_com_start,
+            t_com_end=t_com_end,
+            fps=telemetry_context.get("fps"),
+            gesture=gesture,
+            command=command,
+        )
+        record["engagement_active"] = self.engagement_active
+        record["slide_show_started"] = self.slide_show_started
+        if error is not None:
+            record["error"] = error
+        self.telemetry_writer.write(record)
+
     def run(self):
         while self.running:
             try:
                 data = self.action_queue.get(timeout=0.1)
-                landmarks, image, multi_hand_landmarks = data
+                landmarks = data["landmarks"]
+                image = data["image"]
+                multi_hand_landmarks = data["multi_hand_landmarks"]
+                telemetry_context = data["telemetry"]
+                t_decision = time.monotonic()
+                gesture = "no_hand"
+                command = None
+                t_com_start = None
+                t_com_end = None
+                telemetry_error = None
 
                 if landmarks and len(landmarks) == 21:
                     landmarks = self.apply_ema(landmarks)
@@ -227,6 +287,17 @@ class ActionThread(threading.Thread):
                     spotlight = self.is_spotlight(fingers)
                     index_right = False
                     two_fingers_left = False
+
+                    if palm_open:
+                        gesture = "palm_open"
+                    elif fist:
+                        gesture = "fist"
+                    elif laser_pointer:
+                        gesture = "laser_pointer"
+                    elif spotlight:
+                        gesture = "spotlight"
+                    else:
+                        gesture = "hand_detected"
 
                     # Always send AR updates for fluid movement, if active and engaged
                     if self.engagement_active:
@@ -251,13 +322,18 @@ class ActionThread(threading.Thread):
                         two_fingers_left = self.are_two_fingers_left(landmarks, self.previous_landmarks)
                     self.previous_landmarks = landmarks
 
+                    if index_right:
+                        gesture = "index_right"
+                    elif two_fingers_left:
+                        gesture = "two_fingers_left"
+
                     if palm_open:
                         if not self.engagement_active:
                             self.engagement_gesture_count += 1
                             if self.engagement_gesture_count >= self.ENGAGEMENT_FRAMES_REQUIRED:
                                 self.engagement_active = True
                                 self.ui_queue.put({"type": "status", "msg": "AWAKE"})
-                                print("Engagement State ACTIVE. System is listening for gestures...")
+                                logger.info("Engagement State ACTIVE. System is listening for gestures...")
                                 self.engagement_gesture_count = 0
                                 time.sleep(0.5)
                         else:
@@ -280,12 +356,17 @@ class ActionThread(threading.Thread):
                                 if not self.slide_show_started:
                                     try:
                                         if self.presentation:
+                                            t_com_start = time.monotonic()
                                             self.presentation.SlideShowSettings.Run()
+                                            t_com_end = time.monotonic()
                                             self.slide_show_started = True
+                                            command = "start_slideshow"
                                             self.ui_queue.put({"type": "action", "msg": "START SLIDESHOW"})
-                                            print("Starting slide show")
+                                            logger.info("Starting slide show")
                                     except Exception as e:
-                                        print(f"Error starting slide show: {e}")
+                                        telemetry_error = str(e)
+                                        t_com_end = time.monotonic()
+                                        logger.exception("Error starting slide show")
                                 self.palm_open_count = 0
                         elif fist:
                             self.fist_count += 1
@@ -295,16 +376,21 @@ class ActionThread(threading.Thread):
                             if self.fist_count >= self.GESTURE_CONSECUTIVE_FRAMES:
                                 self.engagement_active = False
                                 self.ui_queue.put({"type": "status", "msg": "ASLEEP"})
-                                print("Engagement State DEACTIVATED. Sleeping...")
+                                logger.info("Engagement State DEACTIVATED. Sleeping...")
                                 if self.slide_show_started:
                                     try:
                                         if self.presentation and self.presentation.SlideShowWindow:
+                                            t_com_start = time.monotonic()
                                             self.presentation.SlideShowWindow.View.Exit()
+                                            t_com_end = time.monotonic()
                                             self.slide_show_started = False
+                                            command = "end_slideshow"
                                             self.ui_queue.put({"type": "action", "msg": "END SLIDESHOW"})
-                                            print("Ending slide show")
+                                            logger.info("Ending slide show")
                                     except Exception as e:
-                                        print(f"Error ending slide show: {e}")
+                                        telemetry_error = str(e)
+                                        t_com_end = time.monotonic()
+                                        logger.exception("Error ending slide show")
                                 self.fist_count = 0
                         elif index_right:
                             self.index_right_count += 1
@@ -316,12 +402,17 @@ class ActionThread(threading.Thread):
                                     if self.presentation and self.presentation.SlideShowWindow:
                                         current_slide = self.presentation.SlideShowWindow.View.Slide
                                         if current_slide.SlideIndex < self.presentation.Slides.Count:
+                                            t_com_start = time.monotonic()
                                             self.presentation.SlideShowWindow.View.Next()
+                                            t_com_end = time.monotonic()
+                                            command = "next_slide"
                                             self.ui_queue.put({"type": "action", "msg": "NEXT SLIDE ->"})
-                                            print("Next slide")
+                                            logger.info("Next slide")
                                             time.sleep(0.5)
                                 except Exception as e:
-                                    print(f"Error going to next slide: {e}")
+                                    telemetry_error = str(e)
+                                    t_com_end = time.monotonic()
+                                    logger.exception("Error going to next slide")
                                 self.index_right_count = 0
                         elif two_fingers_left:
                             self.two_fingers_left_count += 1
@@ -333,12 +424,17 @@ class ActionThread(threading.Thread):
                                     if self.presentation and self.presentation.SlideShowWindow:
                                         current_slide = self.presentation.SlideShowWindow.View.Slide
                                         if current_slide.SlideIndex > 1:
+                                            t_com_start = time.monotonic()
                                             self.presentation.SlideShowWindow.View.Previous()
+                                            t_com_end = time.monotonic()
+                                            command = "previous_slide"
                                             self.ui_queue.put({"type": "action", "msg": "<- PREV SLIDE"})
-                                            print("Previous slide")
+                                            logger.info("Previous slide")
                                             time.sleep(0.5)
                                 except Exception as e:
-                                    print(f"Error going to previous slide: {e}")
+                                    telemetry_error = str(e)
+                                    t_com_end = time.monotonic()
+                                    logger.exception("Error going to previous slide")
                                 self.two_fingers_left_count = 0
                         else:
                             self.palm_open_count = 0
@@ -355,6 +451,15 @@ class ActionThread(threading.Thread):
                     if not self.engagement_active:
                         self.engagement_gesture_count = 0
 
+                self.emit_telemetry(
+                    telemetry_context,
+                    gesture,
+                    command,
+                    t_decision,
+                    t_com_start=t_com_start,
+                    t_com_end=t_com_end,
+                    error=telemetry_error,
+                )
             except queue.Empty:
                 pass
 
@@ -364,6 +469,7 @@ class ActionThread(threading.Thread):
 
 class UIUpdater(QObject):
     update_signal = pyqtSignal(dict)
+
 
 class HUDWindow(QWidget):
     def __init__(self):
@@ -418,7 +524,7 @@ class HUDWindow(QWidget):
             # Subtracted path
             final_path = path.subtracted(spot_path)
 
-            painter.setBrush(QColor(0, 0, 0, 180)) # 70% opacity black
+            painter.setBrush(QColor(0, 0, 0, 180))
             painter.setPen(Qt.NoPen)
             painter.drawPath(final_path)
 
@@ -441,7 +547,7 @@ class HUDWindow(QWidget):
                 y = int(data.get("y", 0.5) * self.screen_height)
                 self.pointer_pos = QPoint(x, y)
 
-            self.update() # Trigger repaint
+            self.update()
             return
 
         msg = data.get("msg", "")
@@ -461,6 +567,7 @@ class HUDWindow(QWidget):
     def hide_status(self):
         self.label.hide()
 
+
 def check_ui_queue(ui_queue, updater):
     try:
         while True:
@@ -468,6 +575,7 @@ def check_ui_queue(ui_queue, updater):
             updater.update_signal.emit(data)
     except queue.Empty:
         pass
+
 
 def create_image():
     image = Image.new('RGB', (64, 64), color=(50, 50, 50))
@@ -478,29 +586,42 @@ def create_image():
     )
     return image
 
-def main():
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--telemetry", help="Path to a JSONL telemetry output file.")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    telemetry_writer = TelemetryWriter(args.telemetry) if args.telemetry else None
+    if telemetry_writer:
+        logger.info("Telemetry output enabled: %s", args.telemetry)
+
     frame_queue = queue.Queue(maxsize=2)
     action_queue = queue.Queue(maxsize=2)
     ui_queue = queue.Queue()
 
     camera_thread = CameraThread(frame_queue)
     ai_thread = AIThread(frame_queue, action_queue)
-    action_thread = ActionThread(action_queue, ui_queue)
+    action_thread = ActionThread(action_queue, ui_queue, telemetry_writer=telemetry_writer)
 
     camera_thread.start()
     ai_thread.start()
     action_thread.start()
 
-    def on_quit(icon, item):
-        icon.stop()
+    icon = None
+
+    def on_quit(icon_arg, item):
+        del item
+        if icon_arg is not None:
+            icon_arg.stop()
         camera_thread.stop()
         ai_thread.stop()
         action_thread.stop()
         if 'app' in globals() or 'app' in locals():
             app.quit()
-        # Alternatively, force exit if PyQt hangs
-        os._exit(0)
-
 
     # PyQt setup
     # If no display, PyQt will crash, so we protect it
@@ -517,7 +638,7 @@ def main():
         # Timer to poll the UI queue
         queue_timer = QTimer()
         queue_timer.timeout.connect(lambda: check_ui_queue(ui_queue, updater))
-        queue_timer.start(100) # Poll every 100ms
+        queue_timer.start(100)
 
         if pystray_available:
             icon = pystray.Icon("InvisibleAssistant")
@@ -529,18 +650,18 @@ def main():
             tray_thread = threading.Thread(target=icon.run)
             tray_thread.daemon = True
             tray_thread.start()
-            print("System Tray starting. Right click icon to quit.")
+            logger.info("System Tray starting. Right click icon to quit.")
 
-        print("HUD starting.")
+        logger.info("HUD starting.")
         try:
             app.exec_()
         except KeyboardInterrupt:
             pass
         finally:
-            if pystray_available:
+            if icon is not None:
                 icon.stop()
     else:
-        print("Running headless mode. Press Ctrl+C to exit.")
+        logger.info("Running headless mode. Press Ctrl+C to exit.")
         try:
             while True:
                 # Just drain the queue so it doesn't block
@@ -552,9 +673,7 @@ def main():
         except KeyboardInterrupt:
             pass
 
-
-
-    print("Shutting down...")
+    logger.info("Shutting down...")
     camera_thread.stop()
     ai_thread.stop()
     action_thread.stop()
@@ -562,7 +681,12 @@ def main():
     camera_thread.join()
     ai_thread.join()
     action_thread.join()
-    print("Shutdown complete.")
+
+    if telemetry_writer:
+        telemetry_writer.close()
+
+    logger.info("Shutdown complete.")
+
 
 if __name__ == '__main__':
     main()
