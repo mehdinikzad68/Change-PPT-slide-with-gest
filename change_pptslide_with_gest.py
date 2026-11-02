@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import QApplication, QLabel, QWidget
 
 from powerpoint_runtime import PowerPointProcessCache, resolve_active_presentation, resolve_slideshow_view
 from telemetry_utils import TelemetryWriter, build_telemetry_record, compute_fps
+from zoom_utils import ZoomController, is_pinch, pinch_center, pinch_distance
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -174,6 +175,10 @@ class ActionThread(threading.Thread):
         self.MOVEMENT_THRESHOLD = 0.005
         self.GESTURE_CONSECUTIVE_FRAMES = 5
 
+        self.zoom = ZoomController()
+        self.PINCH_MOVEMENT_THRESHOLD = 0.02
+        self.previous_pinch_center = None
+
         self.engagement_active = False
         self.engagement_gesture_count = 0
         self.ENGAGEMENT_FRAMES_REQUIRED = 15
@@ -261,6 +266,74 @@ class ActionThread(threading.Thread):
             return True
         return False
 
+    def handle_pinch(self, landmarks):
+        """Apply pinch zoom (and pinch-move pan) for one frame.
+
+        Returns (command, t_com_start, t_com_end, error). Zoom steps come
+        from ZoomController: spreading the pinch apart zooms in, closing
+        it zooms out, 5% per step between 10% and 400%.
+        """
+        command = None
+        t_com_start = None
+        t_com_end = None
+        error = None
+
+        distance = pinch_distance(landmarks)
+        center = pinch_center(landmarks)
+
+        if not self.slide_show_started:
+            self.previous_pinch_center = center
+            return command, t_com_start, t_com_end, error
+
+        zoom_command = self.zoom.update(distance)
+
+        if zoom_command:
+            try:
+                slideshow_view = self._get_slideshow_view()
+                if slideshow_view:
+                    t_com_start = time.monotonic()
+                    slideshow_view.Zoom = self.zoom.level
+                    t_com_end = time.monotonic()
+                    command = zoom_command
+                    self.ui_queue.put({"type": "action", "msg": f"ZOOM {self.zoom.level}%"})
+                    logger.info("Slide zoom: %s%%", self.zoom.level)
+                else:
+                    logger.info("No slideshow window available for zoom command.")
+            except COM_ERROR as e:
+                error = str(e)
+                if t_com_start is not None:
+                    t_com_end = time.monotonic()
+                logger.exception("PowerPoint COM error while zooming")
+        elif self.zoom.level > 100 and self.previous_pinch_center is not None:
+            # Pinch-move pan, carried over from the legacy zoom script:
+            # while zoomed in, dragging a steady pinch moves the view.
+            dx = center[0] - self.previous_pinch_center[0]
+            dy = center[1] - self.previous_pinch_center[1]
+            if abs(dx) > self.PINCH_MOVEMENT_THRESHOLD or abs(dy) > self.PINCH_MOVEMENT_THRESHOLD:
+                try:
+                    slideshow_view = self._get_slideshow_view()
+                    move_hand = getattr(slideshow_view, "MoveHand", None) if slideshow_view else None
+                    if move_hand:
+                        t_com_start = time.monotonic()
+                        if dx > self.PINCH_MOVEMENT_THRESHOLD:
+                            move_hand(0, 1)
+                        elif dx < -self.PINCH_MOVEMENT_THRESHOLD:
+                            move_hand(0, -1)
+                        if dy > self.PINCH_MOVEMENT_THRESHOLD:
+                            move_hand(1, 0)
+                        elif dy < -self.PINCH_MOVEMENT_THRESHOLD:
+                            move_hand(-1, 0)
+                        t_com_end = time.monotonic()
+                        command = "pan"
+                except Exception as e:
+                    error = str(e)
+                    if t_com_start is not None:
+                        t_com_end = time.monotonic()
+                    logger.exception("PowerPoint error while panning zoomed view")
+
+        self.previous_pinch_center = center
+        return command, t_com_start, t_com_end, error
+
     def emit_telemetry(self, telemetry_context, gesture, command, t_decision, t_com_start=None, t_com_end=None, error=None):
         if not self.telemetry_writer:
             return
@@ -312,10 +385,16 @@ class ActionThread(threading.Thread):
                         fist = all(f == 0 for f in fingers)
                         laser_pointer = self.is_laser_pointer(fingers)
                         spotlight = self.is_spotlight(fingers)
+                        pinch = is_pinch(landmarks)
+                        if not pinch:
+                            self.zoom.reset_anchor()
+                            self.previous_pinch_center = None
                         index_right = False
                         two_fingers_left = False
 
-                        if palm_open:
+                        if pinch:
+                            gesture = "pinch"
+                        elif palm_open:
                             gesture = "palm_open"
                         elif fist:
                             gesture = "fist"
@@ -328,7 +407,7 @@ class ActionThread(threading.Thread):
 
                         # Always send AR updates for fluid movement, if active and engaged
                         if self.engagement_active:
-                            if laser_pointer or spotlight:
+                            if (laser_pointer or spotlight) and not pinch:
                                 # Index finger tip is landmark 8. We mirror the x coordinate so it feels like a mirror.
                                 # Also sometimes coordinates go slightly out of 0-1 bounds.
                                 x = 1.0 - landmarks[8].x
@@ -349,7 +428,9 @@ class ActionThread(threading.Thread):
                             two_fingers_left = self.are_two_fingers_left(landmarks, self.previous_landmarks)
                         self.previous_landmarks = landmarks
 
-                        if index_right:
+                        if pinch:
+                            pass
+                        elif index_right:
                             gesture = "index_right"
                         elif two_fingers_left:
                             gesture = "two_fingers_left"
@@ -375,7 +456,19 @@ class ActionThread(threading.Thread):
                             self.index_right_count = 0
                             self.two_fingers_left_count = 0
                         else:
-                            if palm_open:
+                            if pinch:
+                                self.palm_open_count = 0
+                                self.fist_count = 0
+                                self.index_right_count = 0
+                                self.two_fingers_left_count = 0
+                                pinch_result = self.handle_pinch(landmarks)
+                                if pinch_result[0]:
+                                    command = pinch_result[0]
+                                    t_com_start = pinch_result[1]
+                                    t_com_end = pinch_result[2]
+                                if pinch_result[3] is not None:
+                                    telemetry_error = pinch_result[3]
+                            elif palm_open:
                                 self.fist_count = 0
                                 self.index_right_count = 0
                                 self.two_fingers_left_count = 0
@@ -415,6 +508,8 @@ class ActionThread(threading.Thread):
                                                 slideshow_view.Exit()
                                                 t_com_end = time.monotonic()
                                                 self.slide_show_started = False
+                                                self.zoom.level = 100
+                                                self.zoom.reset_anchor()
                                                 command = "end_slideshow"
                                                 self.ui_queue.put({"type": "action", "msg": "END SLIDESHOW"})
                                                 logger.info("Ending slide show")
@@ -488,6 +583,8 @@ class ActionThread(threading.Thread):
                     else:
                         self.previous_landmarks = None
                         self.smoothed_landmarks = None
+                        self.zoom.reset_anchor()
+                        self.previous_pinch_center = None
                         self.palm_open_count = 0
                         self.fist_count = 0
                         self.index_right_count = 0
