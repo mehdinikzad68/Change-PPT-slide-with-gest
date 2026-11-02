@@ -21,9 +21,7 @@ The main controller runs invisibly in the background — no camera preview windo
 - **Thread-Safe COM Handling**: All PowerPoint COM calls live inside the ActionThread's own COM apartment (`CoInitialize` / `CoUninitialize`), and the active presentation / slideshow view is re-resolved for every command — so switching files or restarting the slideshow works without restarting the app.
 - **Robust Gesture Recognition**: A gesture must be held for 5 consecutive frames before it fires, preventing accidental triggers.
 - **Optional Telemetry**: With `--telemetry <path>`, every frame's timing (capture → inference → decision → COM), FPS, gesture, command, and errors are written as JSONL for latency analysis.
-- **Two Controller Modes**:
-  1. `change_pptslide_with_gest.py` — the current controller: multithreaded, invisible HUD/tray, clutch, AR tools, and telemetry.
-  2. `change_pptslide_with_gest_with_zoom.py` — the earlier standalone controller with an OpenCV preview window and pinch-based slide zoom (see the note under Project Structure).
+- **Pinch Zoom & Pan**: While a slideshow is running, pinch thumb and index together and spread them apart to zoom in, or close them to zoom out (5% steps, 10%–400%). Dragging a steady pinch while zoomed in pans the view.
 
 ---
 
@@ -41,16 +39,18 @@ First, **wake the system**: hold an open palm until the HUD shows `AWAKE`. While
 | ✌️ **Two Fingers Swipe Left** | **Previous Slide** | Extend index + middle fingers and swipe to the left. |
 | ☝️ **Index Finger Only** | **Laser Pointer** | While awake, hold up only the index finger: a red dot follows your fingertip (mirrored, like a mirror image) on the HUD overlay. |
 | 🤏 **Thumb + Index (L-Shape)** | **Spotlight** | While awake, extend thumb + index: the screen darkens except for a circular spotlight around your fingertip. |
+| 🤏 **Pinch (tips touching)** | **Zoom In / Out** | While a slideshow is running, pinch thumb and index tips together and spread/close them to zoom (see Zoom below). |
 
 Slide navigation is bounded: “next” does nothing on the last slide and “previous” does nothing on the first slide.
 
-### Zoom controller (`change_pptslide_with_gest_with_zoom.py`)
-
-Same start / end / next / previous gestures as above (without the wake-up clutch), plus:
+### Zoom (main controller, slideshow running)
 
 | Gesture | Action | Description |
 | :--- | :--- | :--- |
-| 🤏 **Pinch Distance Change** | **Zoom In / Out** | Change the distance between thumb and index fingertip to zoom the slideshow view in 5% steps, between 10% and 400%. While zooming, moving a closed-fist pinch pans the view (`View.MoveHand`). |
+| 🤏 **Pinch & Spread / Close** | **Zoom In / Out** | Touch thumb tip to index tip (a pinch), then spread them apart to zoom in or bring them back together to zoom out — 5% per step, between 10% and 400%. The HUD shows the current level (e.g. `ZOOM 150%`). |
+| 🤏 **Pinch & Drag** | **Pan Zoomed View** | While zoomed in above 100%, drag a steady pinch to move the view around the slide. |
+
+A pinch is recognised by the two fingertips *touching*, so it never conflicts with the spotlight gesture, where thumb and index form an open L-shape with the tips far apart.
 
 ---
 
@@ -98,19 +98,15 @@ pip install -r requirements.txt
      ```bash
      python change_pptslide_with_gest.py --telemetry telemetry.jsonl
      ```
-   - For the zoom controller with camera preview:
-     ```bash
-     python change_pptslide_with_gest_with_zoom.py
-     ```
 3. **Control your presentation** (main controller):
    - Hold an **open palm** until the HUD shows `AWAKE`.
    - Hold the **open palm** again briefly to start the slideshow.
    - Swipe **index finger right** for the next slide, **two fingers left** for the previous slide.
    - Use **index only** for the laser pointer, or **thumb + index** for the spotlight.
+   - **Pinch** thumb and index tips together and spread them apart to zoom in; close them to zoom out; drag a steady pinch to pan while zoomed in.
    - Show a **fist** to end the slideshow and put the system back to sleep.
 4. **Exit the program**:
-   - Main controller: right-click the **system-tray icon** (“Invisible Presentation Assistant”) and choose **Quit**. There is no camera window. (On a headless/no-display run, press `Ctrl+C`.)
-   - Zoom controller: focus the camera preview window and press `ESC`.
+   - Right-click the **system-tray icon** (“Invisible Presentation Assistant”) and choose **Quit**. There is no camera window. (On a headless/no-display run, press `Ctrl+C`.)
 
 ---
 
@@ -120,7 +116,7 @@ Running the main controller with `--telemetry telemetry.jsonl` writes one JSON o
 
 - `t_capture`, `t_infer_start`, `t_infer_end`, `t_decision`, `t_com_start`, `t_com_end`
 - Derived timings: `frame_age`, `infer_duration`, `com_duration`
-- `fps`, `gesture`, `command` (e.g. `start_slideshow`, `next_slide`, `previous_slide`, `end_slideshow`)
+- `fps`, `gesture`, `command` (e.g. `start_slideshow`, `next_slide`, `previous_slide`, `end_slideshow`, `zoom_in`, `zoom_out`, `pan`)
 - `engagement_active`, `slide_show_started`, and `error` when a COM call fails
 
 ---
@@ -130,20 +126,21 @@ Running the main controller with `--telemetry telemetry.jsonl` writes one JSON o
 ```
 Change-PPT-slide-with-gest/
 │
-├── change_pptslide_with_gest.py           # Main controller: multithreaded, HUD + tray, clutch, AR tools, telemetry
-├── change_pptslide_with_gest_with_zoom.py # Standalone zoom controller (single-threaded, OpenCV preview window)
+├── change_pptslide_with_gest.py           # Main controller: multithreaded, HUD + tray, clutch, AR tools, zoom, telemetry
 ├── powerpoint_runtime.py                  # PowerPoint helpers: cached process check + active presentation / slideshow resolvers
 ├── telemetry_utils.py                     # FPS calculation, telemetry records, thread-safe JSONL writer
+├── zoom_utils.py                          # Pure pinch-zoom logic: pinch detection, anchor-based zoom steps, limits
 ├── tests/
 │   ├── test_powerpoint_runtime.py         # Unit tests for the process cache and resolvers
-│   └── test_telemetry_utils.py            # Unit tests for FPS, frame age, and JSONL output
+│   ├── test_telemetry_utils.py            # Unit tests for FPS, frame age, and JSONL output
+│   └── test_zoom_utils.py                 # Unit tests for pinch detection and zoom steps/clamps
 ├── requirements.txt                       # Project dependencies (mediapipe pinned to 0.10.14)
 ├── LICENSE                                # MIT License
 ├── .gitignore
 └── README.md
 ```
 
-> **Note on the zoom controller:** it predates the current architecture — it is a single script with a visible camera window, connects to (or starts) PowerPoint once at launch, and binds that presentation for the whole run. The clutch, HUD, tray, AR tools, and telemetry exist only in the main controller.
+> **Note:** pinch zoom originally lived in a separate standalone script (`change_pptslide_with_gest_with_zoom.py`). It was ported into the main controller (logic in `zoom_utils.py`) and the legacy script was removed; it remains available in the git history before that change.
 
 ---
 
